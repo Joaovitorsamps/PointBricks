@@ -417,9 +417,9 @@ def _fmt_id(valor, regra):
     return texto
 
 
-def _fmt_data(valor, regra):
+def _fmt_data(valor, regra, epoch=None):
     """Converte data/período para ISO AAAA-MM-DD; período vira o dia 1 do mês."""
-    from openpyxl.utils.datetime import from_excel as _excel_serial_para_data
+    from openpyxl.utils.datetime import WINDOWS_EPOCH, from_excel as _excel_serial_para_data
 
     periodo = regra["tipo"] == "periodo"
     if isinstance(valor, datetime):
@@ -432,7 +432,8 @@ def _fmt_data(valor, regra):
         # Número de série do Excel (célula com formato Geral): 1 = 1900-01-01; 109574 = 2199-12-31.
         _excel_exigir(math.isfinite(valor) and 1 <= valor <= 109574,
                       "Número fora da faixa de datas do Excel.")
-        convertido = _excel_serial_para_data(valor)
+        # Número de série depende da data base da pasta de trabalho (1900 ou 1904).
+        convertido = _excel_serial_para_data(valor, epoch=epoch or WINDOWS_EPOCH)
         _excel_exigir(periodo or regra["aceitar_horario"] or float(valor).is_integer(),
                       "Data contém horário; declare aceitar_horario=True para descartá-lo.")
         dia = convertido.date() if isinstance(convertido, datetime) else convertido
@@ -492,7 +493,7 @@ def _fmt_numero(valor, regra):
     return "0" if texto in ("-0", "") else texto
 
 
-def _excel_normalizar(valor, regra):
+def _excel_normalizar(valor, regra, epoch=None):
     """Aplica o formato declarado da coluna; sem formato, mantém a leitura estrita."""
     if regra is None:
         return _excel_texto(valor)
@@ -501,7 +502,7 @@ def _excel_normalizar(valor, regra):
     if regra["tipo"] == "id":
         return _fmt_id(valor, regra)
     if regra["tipo"] in ("periodo", "data"):
-        return _fmt_data(valor, regra)
+        return _fmt_data(valor, regra, epoch)
     return _fmt_numero(valor, regra)
 
 
@@ -597,7 +598,7 @@ def _excel_ler(conteudo, arquivo, cfg, fonte, restantes):
                         "chave numérica exige formato id.",
                     )
                 try:
-                    registro[nome] = _excel_normalizar(valor, regra)
+                    registro[nome] = _excel_normalizar(valor, regra, wb.epoch)
                 except ExcelQualidadeError as erro:
                     raise ExcelQualidadeError(f"{fonte}, linha {numero}, {nome}: {erro}") from None
             registro["_fonte"] = fonte

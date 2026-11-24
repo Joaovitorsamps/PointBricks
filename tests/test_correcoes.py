@@ -9,6 +9,9 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904
 from PointBricks._core import (
     ExcelQualidadeError,
     _excel_compilar_formatos,
+    _excel_config_leitura,
+    _excel_ler,
+    _fmt_data,
     _fmt_numero,
 )
 
@@ -41,3 +44,41 @@ def test_simbolo_personalizado():
     assert _fmt_numero("US$ 1,234.56", r) == "1234.56"
     with pytest.raises(ExcelQualidadeError):
         _fmt_numero("1US$234.56", r)
+
+
+# --- Data base 1904 -----------------------------------------------------------
+
+
+def xlsx(linhas, epoch=None):
+    wb = Workbook()
+    if epoch is not None:
+        wb.epoch = epoch
+    ws = wb.active
+    ws.title = "Dados"
+    for linha in linhas:
+        ws.append(linha)
+    buffer = BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+def ler_data(conteudo, tipo="data"):
+    arquivo = {"drive_id": "d", "item_id": "i", "aba": "Dados"}
+    cfg = _excel_config_leitura([arquivo], {"Data": "date"}, [], None, {"Data": {"tipo": tipo}})
+    return _excel_ler(conteudo, arquivo, cfg, "Fonte 1", 1000)[0]["Data"]
+
+
+def test_planilha_1904_converte_serie_corretamente():
+    assert ler_data(xlsx([["Data"], [45000]], epoch=CALENDAR_MAC_1904)) == "2027-03-16"
+
+
+def test_planilha_1904_periodo():
+    assert ler_data(xlsx([["Data"], [45000]], epoch=CALENDAR_MAC_1904), "periodo") == "2027-03-01"
+
+
+def test_planilha_1900_continua_igual():
+    assert ler_data(xlsx([["Data"], [45000]])) == "2023-03-15"
+
+
+def test_fmt_data_sem_epoch_usa_1900():
+    assert _fmt_data(45000, regra("date", tipo="data")) == "2023-03-15"
