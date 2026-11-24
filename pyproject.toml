@@ -11,5 +11,12 @@ license = {file = "LICENSE"}
 requires-python = ">=3.10"
 dependencies = ["azure-identity>=1.25.1,<2", "openpyxl>=3.1.5,<4", "requests>=2.32,<3", "urllib3>=1.26,<3"]
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
