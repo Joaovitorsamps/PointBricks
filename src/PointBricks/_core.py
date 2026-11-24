@@ -461,8 +461,19 @@ def _fmt_numero(valor, regra):
         texto = format(_FmtDecimal(valor), "f")
     elif isinstance(valor, str):
         bruto = valor.replace("\u00a0", " ").strip()
-        if regra["simbolo"]:
-            bruto = bruto.replace(regra["simbolo"], "", 1).strip()
+        if regra["simbolo"] and regra["simbolo"] in bruto:
+            # O símbolo só pode ficar no início (depois do sinal) ou no fim.
+            # No meio do número ("10R$5") ele juntaria dígitos sem aviso.
+            simbolo = re.escape(regra["simbolo"])
+            inicio = re.fullmatch(rf"([+-]?)\s*{simbolo}(.*)", bruto, re.S)
+            fim = re.fullmatch(rf"(.*?)\s*{simbolo}", bruto, re.S)
+            if inicio:
+                bruto = (inicio[1] + inicio[2]).strip()
+            elif fim:
+                bruto = fim[1].strip()
+            else:
+                raise ExcelQualidadeError(
+                    "Símbolo monetário fora do início ou do fim do valor.")
         if regra["separador_milhar"] != " ":
             bruto = bruto.replace(" ", "")
         achado = regra["_padrao"].fullmatch(bruto)
