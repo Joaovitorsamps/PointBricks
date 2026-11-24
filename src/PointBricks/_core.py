@@ -105,7 +105,7 @@ def _excel_contrato(schema, chaves, obrigatorias, regras):
     return chaves, sorted(set(chaves + obrigatorias)), regras
 
 
-def _excel_config_leitura(arquivos, schema, chaves, limites, formatos=None):
+def _excel_config_leitura(arquivos, schema, chaves, limites, formatos=None, localidade=None):
     _excel_exigir(isinstance(arquivos, (list, tuple)) and bool(arquivos),
                   "Informe uma lista não vazia de arquivos.")
     limites = dict(limites or {})
@@ -113,7 +113,7 @@ def _excel_config_leitura(arquivos, schema, chaves, limites, formatos=None):
                   "Há limites de leitura desconhecidos.")
     cfg = {**deepcopy(_EXCEL_PADROES), **limites,
            "colunas": dict(schema), "chaves": list(chaves), "arquivos": deepcopy(arquivos),
-           "formatos": _excel_compilar_formatos(formatos, schema)}
+           "formatos": _excel_compilar_formatos(formatos, schema, localidade)}
     for campo in ("max_mb_por_arquivo", "max_mb_descompactado", "max_linhas_total",
                   "max_linhas_por_aba", "max_colunas_por_aba"):
         _excel_exigir(type(cfg[campo]) is int and cfg[campo] > 0,
@@ -258,13 +258,42 @@ _FMT_PADRAO_DATAS = {
     "periodo": ["%Y-%m", "%m/%Y", "%Y-%m-%d", "%d/%m/%Y"],
 }
 
+# Localidade declarada pelo consumidor: define como datas e números decimais
+# aparecem em texto. ISO (AAAA-MM-DD) é aceito em todas, por não ser ambíguo.
+# Não se aplica a IDs nem a inteiros.
+_FMT_LOCALIDADES = {
+    "pt_BR": {
+        "separador_decimal": ",",
+        "separador_milhar": ".",
+        "data": ["%d/%m/%Y", "%Y-%m-%d"],
+        "periodo": ["%m/%Y", "%d/%m/%Y", "%Y-%m", "%Y-%m-%d"],
+    },
+    "en_US": {
+        "separador_decimal": ".",
+        "separador_milhar": ",",
+        "data": ["%m/%d/%Y", "%Y-%m-%d"],
+        "periodo": ["%m/%Y", "%m/%d/%Y", "%Y-%m", "%Y-%m-%d"],
+    },
+}
+_FMT_TIPOS_COM_LOCALIDADE = ("data", "periodo", "decimal", "moeda")
 
-def _excel_compilar_formatos(formatos, schema):
-    """Valida a configuração de formatos contra o schema e aplica os padrões."""
+
+def _fmt_validar_localidade(localidade, contexto):
+    _excel_exigir(localidade is None or localidade in _FMT_LOCALIDADES,
+                  f"{contexto}: localidade deve ser None ou uma de {sorted(_FMT_LOCALIDADES)}.")
+
+
+def _excel_compilar_formatos(formatos, schema, localidade=None):
+    """Valida a configuração de formatos contra o schema e aplica os padrões.
+
+    Precedência: opção explícita da coluna > localidade da coluna >
+    localidade geral > padrões atuais (sem localidade nada muda).
+    """
+    _fmt_validar_localidade(localidade, "localidade")
     if not formatos:
         return {}
     _excel_exigir(isinstance(formatos, dict), "formatos deve ser um dicionário {coluna: regra}.")
-    gerais = {"tipo"}
+    gerais = {"tipo", "localidade"}
     datas = {"formatos_texto", "aceitar_horario"}
     numericos = {"separador_decimal", "separador_milhar", "simbolo"}
     compilados = {}
@@ -290,6 +319,14 @@ def _excel_compilar_formatos(formatos, schema):
         )
         _excel_exigir(not (set(regra) - permitidos),
                       f"{coluna}: opções não suportadas para {tipo}: {sorted(set(regra) - permitidos)}.")
+
+        if "localidade" in regra:
+            _excel_exigir(tipo in _FMT_TIPOS_COM_LOCALIDADE,
+                          f"{coluna}: localidade se aplica só a {', '.join(_FMT_TIPOS_COM_LOCALIDADE)}.")
+            _fmt_validar_localidade(regra["localidade"], coluna)
+        else:
+            regra["localidade"] = localidade if tipo in _FMT_TIPOS_COM_LOCALIDADE else None
+        local = _FMT_LOCALIDADES.get(regra["localidade"])
 
         if tipo == "id":
             _excel_exigir(
@@ -318,7 +355,7 @@ def _excel_compilar_formatos(formatos, schema):
 
         if tipo in ("periodo", "data"):
             _excel_exigir(destino == "date", f"{coluna}: {tipo} exige schema date.")
-            regra.setdefault("formatos_texto", list(_FMT_PADRAO_DATAS[tipo]))
+            regra.setdefault("formatos_texto", list((local or _FMT_PADRAO_DATAS)[tipo]))
             regra.setdefault("aceitar_horario", False)
             padroes = regra["formatos_texto"]
             _excel_exigir(isinstance(padroes, (list, tuple)) and bool(padroes)
@@ -338,6 +375,9 @@ def _excel_compilar_formatos(formatos, schema):
         else:
             _excel_exigir(destino.startswith("decimal") or destino == "double",
                           f"{coluna}: decimal exige schema decimal(p,s) ou double.")
+        if local and "separador_decimal" not in regra:
+            regra["separador_decimal"] = local["separador_decimal"]
+            regra.setdefault("separador_milhar", local["separador_milhar"])
         regra.setdefault("separador_decimal", ",")
         regra.setdefault("separador_milhar", "." if regra["separador_decimal"] == "," else None)
         regra.setdefault("simbolo", "R$" if tipo == "moeda" else None)
@@ -356,6 +396,9 @@ def _excel_compilar_formatos(formatos, schema):
             mil = re.escape(regra["separador_milhar"])
             corpo = rf"(?:[0-9]{{1,3}}(?:{mil}[0-9]{{3}})+|[0-9]+)"
         regra["_padrao"] = re.compile(rf"([+-]?)({corpo})(?:{dec}([0-9]+))?")
+        # Com localidade declarada, espaços só são aceitos entre sinal, símbolo
+        # e valor; dentro dos dígitos ("12 34") o valor não bate com o formato.
+        regra["_estrito"] = local is not None
         compilados[coluna] = regra
     return compilados
 
@@ -475,7 +518,11 @@ def _fmt_numero(valor, regra):
             else:
                 raise ExcelQualidadeError(
                     "Símbolo monetário fora do início ou do fim do valor.")
-        if regra["separador_milhar"] != " ":
+        if regra.get("_estrito"):
+            sinal_separado = re.fullmatch(r"([+-])\s+(.*)", bruto, re.S)
+            if sinal_separado:
+                bruto = sinal_separado[1] + sinal_separado[2]
+        elif regra["separador_milhar"] != " ":
             bruto = bruto.replace(" ", "")
         achado = regra["_padrao"].fullmatch(bruto)
         _excel_exigir(achado is not None, "Texto numérico fora do formato declarado.")
@@ -762,7 +809,7 @@ def validar_dataframe(
 
 def ler_excel_validado(
     *, login, arquivos, schema, chaves=None, obrigatorias=None, regras=None, limites=None,
-    formatos=None, retornar_origem=False,
+    formatos=None, retornar_origem=False, localidade=None,
 ):
     """Lê 1+ Excel de Microsoft 365 e devolve um DataFrame Spark validado.
 
@@ -776,6 +823,9 @@ def ler_excel_validado(
     formatos: opcional {coluna: {"tipo": id|data|periodo|inteiro|decimal|moeda, ...}}.
               Interpreta códigos numéricos, datas em texto/série e números "1.234,56" / "R$".
               Chave numérica no Excel exige formato id.
+    localidade: opcional "pt_BR" | "en_US". Define separadores e ordem dia/mês das
+                colunas com formato data, periodo, decimal ou moeda (cada coluna pode
+                declarar a sua). Sem localidade, o comportamento é o de sempre.
     retornar_origem: True devolve (df, origem), com nome/eTag/IDs de cada arquivo lido
                      (útil para registrar_snapshot(origem=...)).
 
@@ -786,7 +836,7 @@ def ler_excel_validado(
     spark = _sessao_spark()
 
     chaves, obrigatorias, regras = _excel_contrato(schema, chaves, obrigatorias, regras)
-    cfg = _excel_config_leitura(arquivos, schema, chaves, limites, formatos)
+    cfg = _excel_config_leitura(arquivos, schema, chaves, limites, formatos, localidade)
     graph = _ExcelGraph(login)
     try:
         metadados = [graph.metadata(a) for a in cfg["arquivos"]]
