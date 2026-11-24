@@ -30,6 +30,8 @@ _EXCEL_PADROES = {
     "max_colunas_por_aba": 200,
     "permitir_arquivo_vazio": False,
     "permitir_base_vazia": False,
+    # True: número em coluna string sem formato reprova a carga (protege zeros à esquerda).
+    "rejeitar_numero_em_texto": False,
 }
 
 
@@ -118,7 +120,7 @@ def _excel_config_leitura(arquivos, schema, chaves, limites, formatos=None):
                   "max_linhas_por_aba", "max_colunas_por_aba"):
         _excel_exigir(type(cfg[campo]) is int and cfg[campo] > 0,
                       f"{campo} deve ser inteiro > 0.")
-    for campo in ("permitir_arquivo_vazio", "permitir_base_vazia"):
+    for campo in ("permitir_arquivo_vazio", "permitir_base_vazia", "rejeitar_numero_em_texto"):
         _excel_exigir(type(cfg[campo]) is bool, f"{campo} deve ser True/False.")
     fontes = []
     for arquivo in arquivos:
@@ -253,6 +255,10 @@ def _excel_texto(valor):
 
 _FmtDecimal = Decimal
 
+# Número de série menor que este ano em coluna de data costuma ser outro dado
+# digitado por engano (ex.: o ano 2024 vira 1905-07-16). Ajustável por coluna.
+_FMT_ANO_MINIMO_SERIE = 1950
+
 _FMT_PADRAO_DATAS = {
     "data": ["%Y-%m-%d", "%d/%m/%Y"],
     "periodo": ["%Y-%m", "%m/%Y", "%Y-%m-%d", "%d/%m/%Y"],
@@ -265,8 +271,8 @@ def _excel_compilar_formatos(formatos, schema):
         return {}
     _excel_exigir(isinstance(formatos, dict), "formatos deve ser um dicionário {coluna: regra}.")
     gerais = {"tipo"}
-    datas = {"formatos_texto", "aceitar_horario"}
-    numericos = {"separador_decimal", "separador_milhar", "simbolo"}
+    datas = {"formatos_texto", "aceitar_horario", "ano_minimo_serie"}
+    numericos = {"separador_decimal", "separador_milhar", "simbolo", "rejeitar_milhar_ambiguo"}
     compilados = {}
     for coluna, regra in formatos.items():
         _excel_exigir(coluna in schema, f"{coluna}: formato para coluna fora do schema.")
@@ -327,6 +333,10 @@ def _excel_compilar_formatos(formatos, schema):
             regra["formatos_texto"] = list(padroes)
             _excel_exigir(type(regra["aceitar_horario"]) is bool,
                           f"{coluna}: aceitar_horario deve ser booleano.")
+            regra.setdefault("ano_minimo_serie", _FMT_ANO_MINIMO_SERIE)
+            _excel_exigir(type(regra["ano_minimo_serie"]) is int
+                          and 1900 <= regra["ano_minimo_serie"] <= 2199,
+                          f"{coluna}: ano_minimo_serie deve ser inteiro entre 1900 e 2199.")
             compilados[coluna] = regra
             continue
 
@@ -341,6 +351,9 @@ def _excel_compilar_formatos(formatos, schema):
         regra.setdefault("separador_decimal", ",")
         regra.setdefault("separador_milhar", "." if regra["separador_decimal"] == "," else None)
         regra.setdefault("simbolo", "R$" if tipo == "moeda" else None)
+        regra.setdefault("rejeitar_milhar_ambiguo", False)
+        _excel_exigir(type(regra["rejeitar_milhar_ambiguo"]) is bool,
+                      f"{coluna}: rejeitar_milhar_ambiguo deve ser booleano.")
         _excel_exigir(regra["separador_decimal"] in (",", "."),
                       f"{coluna}: separador_decimal deve ser ',' ou '.'.")
         _excel_exigir(regra["separador_milhar"] in (None, ".", ",", " ")
@@ -364,19 +377,27 @@ def _fmt_id(valor, regra):
     """Padroniza IDs numéricos integrais e preserva IDs textuais."""
     if isinstance(valor, str):
         texto = valor.strip()
-
-        if regra["texto_decimal_inteiro"]:
-            achado = re.fullmatch(
-                r"([+-]?[0-9]+)[.,]([0-9]+)",
-                texto,
+        # "123,0" / "123.00": número inteiro salvo como texto decimal.
+        # Códigos como "3.1" não casam (fração diferente de zero) e são preservados.
+        achado = re.fullmatch(r"([+-]?[0-9]+)[.,](0+)", texto)
+        if achado:
+            # "1.000" pode ser mil (separador de milhar) ou 1: não adivinhar.
+            _excel_exigir(
+                len(achado[2]) != 3,
+                "ID textual ambíguo: o separador pode ser de milhar; corrija a origem",
             )
-
-            if achado:
-                _excel_exigir(
-                    set(achado[2]) <= {"0"},
-                    "ID textual numérico contém fração",
-                )
-                texto = achado[1]
+            # Sem a opção, "123,0" e o número 123 virariam chaves diferentes.
+            _excel_exigir(
+                regra["texto_decimal_inteiro"],
+                "ID textual com fração zero; declare texto_decimal_inteiro=True "
+                "para convertê-lo em inteiro",
+            )
+            texto = achado[1]
+        elif regra["texto_decimal_inteiro"]:
+            _excel_exigir(
+                re.fullmatch(r"[+-]?[0-9]+[.,][0-9]+", texto) is None,
+                "ID textual numérico contém fração",
+            )
 
     else:
         _excel_exigir(
@@ -417,9 +438,9 @@ def _fmt_id(valor, regra):
     return texto
 
 
-def _fmt_data(valor, regra):
+def _fmt_data(valor, regra, epoch=None):
     """Converte data/período para ISO AAAA-MM-DD; período vira o dia 1 do mês."""
-    from openpyxl.utils.datetime import from_excel as _excel_serial_para_data
+    from openpyxl.utils.datetime import WINDOWS_EPOCH, from_excel as _excel_serial_para_data
 
     periodo = regra["tipo"] == "periodo"
     if isinstance(valor, datetime):
@@ -432,10 +453,15 @@ def _fmt_data(valor, regra):
         # Número de série do Excel (célula com formato Geral): 1 = 1900-01-01; 109574 = 2199-12-31.
         _excel_exigir(math.isfinite(valor) and 1 <= valor <= 109574,
                       "Número fora da faixa de datas do Excel.")
-        convertido = _excel_serial_para_data(valor)
+        convertido = _excel_serial_para_data(valor, epoch=epoch or WINDOWS_EPOCH)
         _excel_exigir(periodo or regra["aceitar_horario"] or float(valor).is_integer(),
                       "Data contém horário; declare aceitar_horario=True para descartá-lo.")
         dia = convertido.date() if isinstance(convertido, datetime) else convertido
+        _excel_exigir(
+            dia.year >= regra["ano_minimo_serie"],
+            f"Número {valor} vira a data {dia.isoformat()}, anterior a "
+            f"{regra['ano_minimo_serie']}; corrija a célula ou ajuste ano_minimo_serie.",
+        )
     elif isinstance(valor, str):
         texto = valor.strip()
         dia = None
@@ -461,14 +487,31 @@ def _fmt_numero(valor, regra):
         texto = format(_FmtDecimal(valor), "f")
     elif isinstance(valor, str):
         bruto = valor.replace("\u00a0", " ").strip()
-        if regra["simbolo"]:
-            bruto = bruto.replace(regra["simbolo"], "", 1).strip()
-        if regra["separador_milhar"] != " ":
-            bruto = bruto.replace(" ", "")
+        simbolo = regra["simbolo"]
+        if simbolo:
+            # Símbolo só no início (após o sinal, se houver) ou no fim; nunca no meio.
+            simbolo_re = re.escape(simbolo)
+            inicio = re.fullmatch(rf"([+-]?) ?{simbolo_re} ?(.+)", bruto)
+            fim = re.fullmatch(rf"(.+?) ?{simbolo_re}", bruto)
+            if inicio:
+                resto = inicio[2]
+                if inicio[1]:
+                    _excel_exigir(resto[:1] not in "+-", "Sinal repetido no número.")
+                bruto = inicio[1] + resto
+            elif fim:
+                bruto = fim[1]
+        # Espaços internos só são aceitos como separador de milhar declarado.
         achado = regra["_padrao"].fullmatch(bruto)
         _excel_exigir(achado is not None, "Texto numérico fora do formato declarado.")
         sinal, inteiro, fracao = achado[1], achado[2], achado[3] or ""
         if regra["separador_milhar"]:
+            if regra["rejeitar_milhar_ambiguo"] and not fracao:
+                # "1.500" pode ser 1500 ou 1,5 escrito com ponto: não adivinhar.
+                _excel_exigir(
+                    inteiro.count(regra["separador_milhar"]) != 1,
+                    "Número ambíguo: um único separador de milhar sem casas decimais; "
+                    "escreva com casas decimais (ex.: 1.500,00) ou sem separador.",
+                )
             inteiro = inteiro.replace(regra["separador_milhar"], "")
         texto = f"{'-' if sinal == '-' else ''}{inteiro}" + (f".{fracao}" if fracao else "")
     else:
@@ -481,7 +524,7 @@ def _fmt_numero(valor, regra):
     return "0" if texto in ("-0", "") else texto
 
 
-def _excel_normalizar(valor, regra):
+def _excel_normalizar(valor, regra, epoch=None):
     """Aplica o formato declarado da coluna; sem formato, mantém a leitura estrita."""
     if regra is None:
         return _excel_texto(valor)
@@ -490,7 +533,7 @@ def _excel_normalizar(valor, regra):
     if regra["tipo"] == "id":
         return _fmt_id(valor, regra)
     if regra["tipo"] in ("periodo", "data"):
-        return _fmt_data(valor, regra)
+        return _fmt_data(valor, regra, epoch)
     return _fmt_numero(valor, regra)
 
 
@@ -585,8 +628,15 @@ def _excel_ler(conteudo, arquivo, cfg, fonte, restantes):
                         f"{fonte}, linha {numero}, {nome}: "
                         "chave numérica exige formato id.",
                     )
+                if (cfg["rejeitar_numero_em_texto"] and regra is None
+                        and cfg["colunas"][nome] == "string"
+                        and isinstance(valor, (int, float, Decimal))
+                        and not isinstance(valor, bool)):
+                    raise ExcelQualidadeError(
+                        f"{fonte}, linha {numero}, {nome}: número em coluna de texto; "
+                        "formate a célula como texto na origem ou declare formato id.")
                 try:
-                    registro[nome] = _excel_normalizar(valor, regra)
+                    registro[nome] = _excel_normalizar(valor, regra, wb.epoch)
                 except ExcelQualidadeError as erro:
                     raise ExcelQualidadeError(f"{fonte}, linha {numero}, {nome}: {erro}") from None
             registro["_fonte"] = fonte
